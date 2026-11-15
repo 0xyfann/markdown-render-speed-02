@@ -1276,11 +1276,43 @@ function parseInline(s, refs, state, extOff) {
   const nodes = [];
   const delims = [];   // {node, ch, canOpen, canClose}; node.len is live
   const allDelims = []; // every delim entry ever created here (stable spans)
-  // Marked quirk: once a link whose label used an unequal-run loose
-  // backtick span has appeared, a later emphasis span is refused when
-  // a code span starts anywhere after its opener.
+  // Marked quirk: once a link whose label holds a backtick but
+  // tokenizes without any code span has appeared, a later emphasis
+  // span is refused when a code span starts anywhere after its opener
+  // (code spans inside later labels count too — the scan is textual).
   let looseLinkPos = -1;
   const codeSpanStarts = [];
+  const labelSpanStarts = [];
+  function codeSpanStartsAfter(pos) {
+    return codeSpanStarts.some((cs) => cs > pos) || labelSpanStarts.some((cs) => cs > pos);
+  }
+  // Record the code span starts inside an accepted link's label text
+  // (labels are tokenized standalone, so a textual scan of the label
+  // finds exactly its spans).
+  function noteLabelSpans(labelText, labelStart) {
+    let j = 0;
+    const m = labelText.length;
+    while (j < m) {
+      if (labelText[j] === '`') {
+        let run = 0;
+        while (labelText[j + run] === '`') run++;
+        let k = j + run, found = -1;
+        while (k < m) {
+          if (labelText[k] === '`') {
+            let r2 = 0;
+            while (labelText[k + r2] === '`') r2++;
+            if (r2 === run) { found = k; break; }
+            k += r2;
+          } else k++;
+        }
+        if (found === -1) { j += run; continue; }
+        labelSpanStarts.push(labelStart + j);
+        j = found + run;
+        continue;
+      }
+      j++;
+    }
+  }
   // Positions of '[' / '![' whose link/image attempt was not accepted.
   const failedBrackets = [];
   let buf = '';
@@ -1428,7 +1460,7 @@ function parseInline(s, refs, state, extOff) {
           const use = op.node.len >= 2 && closer.node.len >= 2 ? 2 : 1;
           if (emphasisBlocked(op, closer, use)) continue;
           if (looseLinkPos !== -1 && looseLinkPos < op.srcStart &&
-              codeSpanStarts.some((cs) => cs > op.srcStart)) continue;
+              codeSpanStartsAfter(op.srcStart)) continue;
           if (tickEmBlocked(op, closer)) continue;
         }
         openerIdx = j;
@@ -1477,11 +1509,6 @@ function parseInline(s, refs, state, extOff) {
     }
   }
 
-  // Side channel: set by scanLabel when the label it scanned used a
-  // loose code span whose closing backtick run differs in length from
-  // its opener.
-  let scanLoose = false;
-
   // Scan a link label starting just after the opening bracket, using
   // marked's label grammar: plain characters, backslash escapes, nested
   // bracket groups, and loose code spans (a backtick run, non-backtick
@@ -1505,10 +1532,8 @@ function parseInline(s, refs, state, extOff) {
         let k = j + run;
         while (k < n && s[k] !== '`') k++;
         if (k < n) {
-          let closeRun = 0;
-          while (s[k + closeRun] === '`') closeRun++;
-          if (closeRun !== run) scanLoose = true;
-          j = k + closeRun; continue;
+          while (s[k] === '`') k++;
+          j = k; continue;
         }
         return -1;
       }
@@ -1542,33 +1567,46 @@ function parseInline(s, refs, state, extOff) {
   // tokenized once the whole construct resolves.
   function matchLinkAt(pos, isImage) {
     const labelStart = pos + (isImage ? 2 : 1);
-    scanLoose = false;
     const labelEnd = scanLabel(labelStart);
     if (labelEnd === -1) return null;
-    const loose = scanLoose;
     const labelText = s.slice(labelStart, labelEnd);
     const after = labelEnd + 1;
     if (s[after] === '(') {
       const r = scanInlineLink(s, after);
-      if (r) return { href: r.href, title: r.title, end: r.end, labelText, loose };
+      if (r) return { href: r.href, title: r.title, end: r.end, labelText };
       // An invalid (...) part falls back to the shortcut reference.
       const d = refs.get(normalizeLabel(labelText));
-      if (d) return { href: d.href, title: d.title, end: after, labelText, loose };
+      if (d) return { href: d.href, title: d.title, end: after, labelText };
       return null;
     }
     if (s[after] === '[') {
-      scanLoose = false;
       const refEnd = scanLabel(after + 1);
       if (refEnd !== -1) {
         const refText = s.slice(after + 1, refEnd);
         const d = refs.get(normalizeLabel(refText === '' ? labelText : refText));
-        if (d) return { href: d.href, title: d.title, end: refEnd + 1, labelText, loose: loose || scanLoose };
+        if (d) return { href: d.href, title: d.title, end: refEnd + 1, labelText };
         return null; // a bracketed label that does not resolve binds
       }
     }
     const d = refs.get(normalizeLabel(labelText));
-    if (d) return { href: d.href, title: d.title, end: after, labelText, loose };
+    if (d) return { href: d.href, title: d.title, end: after, labelText };
     return null;
+  }
+
+  function treeHasCode(ns) {
+    for (const nd of ns) {
+      if (nd.k === 'code') return true;
+      if (nd.children && treeHasCode(nd.children)) return true;
+    }
+    return false;
+  }
+
+  function hasUnescapedBacktick(str) {
+    for (let k = 0; k < str.length; k++) {
+      if (str[k] === '\\') { k++; continue; }
+      if (str[k] === '`') return true;
+    }
+    return false;
   }
 
   while (i < n) {
@@ -1657,7 +1695,8 @@ function parseInline(s, refs, state, extOff) {
         flushText();
         const inner = parseInline(m.labelText, refs, state, extOff);
         nodes.push({ k: 'img', href: m.href, title: m.title, children: inner });
-        if (m.loose && looseLinkPos === -1) looseLinkPos = i;
+        if (looseLinkPos === -1 && hasUnescapedBacktick(m.labelText) && !treeHasCode(inner)) looseLinkPos = i;
+        noteLabelSpans(m.labelText, i + 2);
         i = m.end; continue;
       }
       failedBrackets.push({ pos: i, image: true });
@@ -1673,7 +1712,8 @@ function parseInline(s, refs, state, extOff) {
         if (!containsBracketLink(inner)) {
           flushText();
           nodes.push({ k: 'link', href: m.href, title: m.title, children: inner });
-          if (m.loose && looseLinkPos === -1) looseLinkPos = i;
+          if (looseLinkPos === -1 && hasUnescapedBacktick(m.labelText) && !treeHasCode(inner)) looseLinkPos = i;
+          noteLabelSpans(m.labelText, i + 1);
           i = m.end; continue;
         }
       }
