@@ -1424,16 +1424,17 @@ function parseInline(s, refs, state, extOff) {
         // Loose code span: a backtick run, non-backtick content, and a
         // closing run of any length. An unclosed run fails the label,
         // except a run of 2+ sitting immediately before the closing
-        // bracket, which counts as plain text.
+        // bracket, which counts as plain text — that reading wins over
+        // the span reading even when a backtick exists further away.
         let run = 0;
         while (s[j + run] === '`') run++;
+        if (run >= 2 && depth === 0 && s[j + run] === ']') { j += run; continue; }
         let k = j + run;
         while (k < n && s[k] !== '`') k++;
         if (k < n) {
           while (s[k] === '`') k++;
           j = k; continue;
         }
-        if (run >= 2 && depth === 0 && s[j + run] === ']') { j += run; continue; }
         return -1;
       }
       if (c === '<') {
