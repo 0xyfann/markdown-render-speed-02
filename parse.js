@@ -491,7 +491,13 @@ function parseBlocks(src, refs) {
   // absorb the line; paragraphs/tables/html(6,7) end; a raw blank line
   // (nothing consumed it) also ends every open blockquote, as marked's
   // blockquote chunks stop at blank lines.
-  function blankLine(rem, col, matchedAll, rawBlank, quoteMatched, scopeDepth) {
+  function blankLine(rem, col, matchedAll, rawBlank, quoteMatched, scopeDepth, matchedDepth) {
+    if (!matchedAll) {
+      // The line never reached the deeper containers (e.g. a ">"-only
+      // line with two quotes open): everything below the match closes,
+      // including a fence that would otherwise absorb the blank.
+      closeDownTo(matchedDepth, curLi - 1);
+    }
     const t = tip();
     if (matchedAll && t.t === 'code') {
       t.lines.push(t.fenced ? dropIndent(rem, t.fenceIndent || 0, col) : dropIndent(rem, 4, col));
@@ -535,7 +541,9 @@ function parseBlocks(src, refs) {
     curQuoteCols = 0; curLastQuoteW = 0;
     let depth = 1;
     let matchedAll = true;
+    const remSnap = [line], colSnap = [0];
     for (; depth < stack.length; depth++) {
+      remSnap[depth] = rem; colSnap[depth] = col;
       const b = stack[depth];
       if (b.t === 'quote') {
         let p = 0;
@@ -572,7 +580,22 @@ function parseBlocks(src, refs) {
         break; // leaf reached
       }
     }
-    const matchedDepth = depth;
+    let matchedDepth = depth;
+
+    // Detachment: a list whose item fence absorbed a line through a
+    // failed blockquote ends at the next line that matches the
+    // containers above the list again; that line is reprocessed at the
+    // list's parent depth (marked captures the item text only up to
+    // the absorbed lines).
+    for (let d = stack.length - 1; d >= 1; d--) {
+      if (stack[d].t === 'list' && stack[d].detached && matchedDepth > d) {
+        closeDownTo(d, curLi - 1);
+        rem = remSnap[d]; col = colSnap[d];
+        matchedDepth = d; matchedAll = false;
+        break;
+      }
+      if (stack[d].t === 'list') break;
+    }
 
     if (rem.trim() === '' && matchedAll && tip().t === 'table' && line.includes('\t')) {
       // A whitespace-only line containing a tab is a table row in
@@ -590,37 +613,101 @@ function parseBlocks(src, refs) {
       for (let d = matchedDepth - 1; d >= 1; d--) {
         if (stack[d].t === 'quote') { scopeDepth = d; break; }
       }
-      blankLine(rem, col, matchedAll, rawBlank, quoteMatched, scopeDepth);
+      blankLine(rem, col, matchedAll, rawBlank, quoteMatched, scopeDepth, matchedDepth);
       continue;
+    }
+
+    if (!matchedAll && tip().t === 'code' && tip().fenced &&
+        stack[matchedDepth] && stack[matchedDepth].t === 'quote' &&
+        stack.some((b, d) => b.t === 'item' && d > matchedDepth)) {
+      // The line failed a blockquote in front of an item's fence.
+      // Re-try the item indents on the unstripped remainder: a line
+      // that fits them is fence content (and detaches the list); a
+      // plain line that does not fit ends the list inside the quote
+      // and is reprocessed at the quote's level.
+      let simRem = rem, simCol = col, simOk = true;
+      for (let d = matchedDepth; d < stack.length - 1; d++) {
+        const bt = stack[d].t;
+        if (bt === 'item') {
+          const r = consumeIndent(simRem, stack[d].indent, simCol);
+          if (!r.ok) { simOk = false; break; }
+          simRem = r.rest; simCol += stack[d].indent;
+        } else if (bt !== 'list' && bt !== 'quote') { simOk = false; break; }
+      }
+      const t = tip();
+      if (simOk) {
+        for (let d = stack.length - 2; d >= 1; d--) {
+          if (stack[d].t === 'list') { stack[d].detached = true; break; }
+        }
+        t.lines.push(codeContent(dropIndent(simRem, t.fenceIndent || 0, simCol),
+          simCol + (t.fenceIndent || 0), stackBelowTipInContainer()));
+        t.absorbArmed = true;
+        continue;
+      }
+      if (!t.absorbArmed) {
+        const trimmedSim = simRem.replace(/^[ \t]+/, '');
+        const mkSim = matchListMarker(trimmedSim);
+        if (countIndent(rem, col) <= 3 && !interruptsParagraph(trimmedSim) && !(mkSim && !mkSim.blank)) {
+          closeDownTo(matchedDepth + 1, curLi - 1);
+          rem = remSnap[matchedDepth]; col = colSnap[matchedDepth];
+          matchedAll = false;
+          matchedDepth = stack.length;
+          // fall through to phase 2 with the quote-level remainder
+        }
+      }
     }
 
     if (!matchedAll && tip().t === 'code' && tip().fenced && tip().absorbArmed) {
       // A fenced code block inside a list item, once it has received a
       // content line through the item's indentation, absorbs following
       // non-blank lines even when they no longer match the item (marked
-      // captures the item text with the fence still open). A sibling item
-      // marker or a thematic break still ends the item instead.
-      let ok = true;
-      for (let d = matchedDepth; d < stack.length - 1; d++) {
-        if (stack[d].t !== 'item' && stack[d].t !== 'list') { ok = false; break; }
+      // captures the item text with the fence still open). The failed
+      // containers may include blockquotes; absorbing through a failed
+      // quote detaches the list, which then ends at the next line that
+      // matches the quote again. A sibling item marker or a thematic
+      // break still ends the item instead (item-only failures).
+      let ok = false;
+      let quoteFailed = false;
+      let dropCols = tip().fenceIndent || 0;
+      let fenceItemDepth = -1;
+      for (let d = stack.length - 2; d >= 1; d--) if (stack[d].t === 'item') { fenceItemDepth = d; break; }
+      if (fenceItemDepth >= 0) {
+        ok = true;
+        for (let d = matchedDepth; d < stack.length - 1; d++) {
+          const bt = stack[d].t;
+          if (bt === 'quote') {
+            // A quote outside the fence's item detaches it; a quote
+            // inside the item just ends (no absorption through it).
+            if (d < fenceItemDepth) quoteFailed = true;
+            else { ok = false; break; }
+          }
+          else if (bt === 'item') dropCols += stack[d].indent;
+          else if (bt !== 'list') { ok = false; break; }
+        }
       }
       const trimmedRem = rem.replace(/^[ \t]+/, '');
-      if (ok && !HR_RE.test(trimmedRem)) {
-        const parentList = stack[matchedDepth - 1];
-        const mk = countIndent(rem, col) <= 3 ? matchListMarker(trimmedRem) : null;
-        if (mk && parentList && parentList.t === 'list' && sameListKind(parentList.listKind, mk)) ok = false;
+      if (ok && countIndent(rem, col) <= 3) {
+        // Lines that would start a block at the parent level are not
+        // absorbed: paragraph interrupters (heading, fence, quote, HR,
+        // HTML block) or any non-empty list marker.
+        const mk = matchListMarker(trimmedRem);
+        if (interruptsParagraph(trimmedRem) || (mk && !mk.blank)) ok = false;
       }
       if (ok) {
         const t = tip();
-        const leadW = countIndent(rem, col);
-        const after = leadW <= 3 ? dropIndent(rem, leadW, col) : rem;
-        const m = /^(`{3,}|~{3,})[ \t]*$/.exec(after);
-        if (leadW <= 3 && m && m[1][0] === t.fenceCh && m[1].length >= t.fenceLen) {
-          closeDownTo(matchedDepth, curLi - 1);
-          continue;
+        if (quoteFailed) {
+          for (let d = stack.length - 2; d >= 1; d--) {
+            if (stack[d].t === 'list') { stack[d].detached = true; break; }
+          }
         }
-        t.lines.push(codeContent(dropIndent(rem, t.fenceIndent || 0, col),
-          col + (t.fenceIndent || 0) - Math.max(0, curQuoteCols - curLastQuoteW), stackBelowTipInContainer()));
+        if (SETEXT_RE.test(trimmedRem)) {
+          // A setext-looking absorbed line is shielded with 4 spaces at
+          // the item-text level (before the fence's own indent drop).
+          t.lines.push(dropIndent('    ' + trimmedRem, t.fenceIndent || 0, 0));
+        } else {
+          t.lines.push(codeContent(dropIndent(rem, dropCols, col),
+            col + dropCols - Math.max(0, curQuoteCols - curLastQuoteW), stackBelowTipInContainer()));
+        }
         continue;
       }
     }
