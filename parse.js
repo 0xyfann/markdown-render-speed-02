@@ -1252,12 +1252,26 @@ function extractDefs(text, refs) {
 // Inline parsing
 // ---------------------------------------------------------------------------
 
+// ASCII lookup tables for the two hottest character predicates,
+// built once from the defining regexes; non-ASCII falls back to them.
+const WS_TABLE = new Uint8Array(128);
+const PUNCT_TABLE = new Uint8Array(128);
+for (let c = 0; c < 128; c++) {
+  const ch = String.fromCharCode(c);
+  if (/\s/.test(ch)) WS_TABLE[c] = 1;
+  if (isPunct(ch) || /[\p{P}\p{S}]/u.test(ch)) PUNCT_TABLE[c] = 1;
+}
+
 function isWsCh(ch) {
-  return ch === undefined || /\s/.test(ch);
+  if (ch === undefined) return true;
+  const c = ch.charCodeAt(0);
+  return c < 128 ? WS_TABLE[c] === 1 : /\s/.test(ch);
 }
 
 function isPunctCh(ch) {
   if (ch === undefined) return false;
+  const c = ch.charCodeAt(0);
+  if (c < 128) return PUNCT_TABLE[c] === 1;
   if (isPunct(ch)) return true;
   return /[\p{P}\p{S}]/u.test(ch);
 }
@@ -1272,6 +1286,20 @@ const EXT_URL_RE = /^(?:[hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/|www\.)[^\s<
 const EMAIL_CORE = "[A-Za-z0-9.!#$%&'*+\\/=?^_`{|}~-]+@(?:[A-Za-z0-9_-]+\\.)+[A-Za-z0-9_-]*[A-Za-z0-9]";
 const EXT_EMAIL_RE = new RegExp('^' + EMAIL_CORE);
 const SCHEME_EMAIL_RE = new RegExp('^(mailto|xmpp):(' + EMAIL_CORE + ')');
+// Sticky twins of the anchored inline regexes: execAt matches them at
+// an absolute offset without slicing the string.
+const AUTOLINK_URI_RE_Y = /<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/y;
+const AUTOLINK_EMAIL_RE_Y = /<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)>/y;
+const OPEN_TAG_RE_Y = new RegExp('<' + TAG_NAME + ATTR + '*\\s*\\/?>', 'y');
+const CLOSE_TAG_RE_Y = new RegExp('<\\/' + TAG_NAME + '\\s*>', 'y');
+const EXT_URL_RE_Y = /(?:[hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/|www\.)[^\s<]+/y;
+const EXT_EMAIL_RE_Y = new RegExp(EMAIL_CORE, 'y');
+const SCHEME_EMAIL_RE_Y = new RegExp('(mailto|xmpp):(' + EMAIL_CORE + ')', 'y');
+const XMPP_RES_RE_Y = /\/[A-Za-z0-9@._~-]+/y;
+function execAt(re, s, i) {
+  re.lastIndex = i;
+  return re.exec(s);
+}
 const EMAIL_PREV_BAD = /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~@-]/;
 
 function plainTextOf(list) {
@@ -1564,15 +1592,14 @@ function parseInline(s, refs, state, extOff) {
       if (c === '<') {
         // HTML tags, comments, and <...> autolinks inside a label are
         // skipped as units: a ']' inside them does not close the label.
-        const rest = s.slice(j);
-        const au = AUTOLINK_URI_RE.exec(rest) || AUTOLINK_EMAIL_RE.exec(rest);
+        const au = execAt(AUTOLINK_URI_RE_Y, s, j) || execAt(AUTOLINK_EMAIL_RE_Y, s, j);
         if (au) { j += au[0].length; continue; }
-        const tg = OPEN_TAG_RE.exec(rest) || CLOSE_TAG_RE.exec(rest);
+        const tg = execAt(OPEN_TAG_RE_Y, s, j) || execAt(CLOSE_TAG_RE_Y, s, j);
         if (tg) { j += tg[0].length; continue; }
-        if (rest.startsWith('<!--')) {
-          const e = rest.indexOf('-->');
+        if (s.startsWith('<!--', j)) {
+          const e = s.indexOf('-->', j);
           if (e === -1) return -1;
-          j += e + 3; continue;
+          j = e + 3; continue;
         }
         j++; continue;
       }
@@ -1687,20 +1714,19 @@ function parseInline(s, refs, state, extOff) {
     }
 
     if (ch === '<') {
-      const rest = s.slice(i);
-      let m = AUTOLINK_URI_RE.exec(rest);
+      let m = execAt(AUTOLINK_URI_RE_Y, s, i);
       if (m) {
         flushText();
         nodes.push({ k: 'link', href: m[1], title: null, ang: true, children: [{ k: 't', s: m[1] }] });
         i += m[0].length; continue;
       }
-      m = AUTOLINK_EMAIL_RE.exec(rest);
+      m = execAt(AUTOLINK_EMAIL_RE_Y, s, i);
       if (m) {
         flushText();
         nodes.push({ k: 'link', href: 'mailto:' + m[1], title: null, ang: true, children: [{ k: 't', s: m[1] }] });
         i += m[0].length; continue;
       }
-      const html = scanInlineHtml(rest);
+      const html = scanInlineHtml(s, i);
       if (html) {
         flushText();
         nodes.push({ k: 'html', s: html });
@@ -1775,9 +1801,10 @@ function parseInline(s, refs, state, extOff) {
     }
 
     if (ch === '\n') {
-      const trail = / {2,}$/.exec(buf);
-      if (trail) {
-        buf = buf.slice(0, buf.length - trail[0].length);
+      let k = buf.length;
+      while (k > 0 && buf.charCodeAt(k - 1) === 32) k--;
+      if (buf.length - k >= 2) {
+        buf = buf.slice(0, k);
         flushText();
         nodes.push({ k: 'br' });
         i++;
@@ -1790,11 +1817,11 @@ function parseInline(s, refs, state, extOff) {
 
     // Extended autolinks (GFM): www., scheme://, bare emails, and
     // mailto:/xmpp: scheme emails in text.
+    const cc0 = s.charCodeAt(i);
     if (!(state && state.inLink) && !extOff &&
-        (ch === 'w' || ch === 'h' || ch === 'f' || ch === 'm' || ch === 'x' || /[A-Za-z0-9]/.test(ch)) &&
+        ((cc0 >= 48 && cc0 <= 57) || (cc0 >= 65 && cc0 <= 90) || (cc0 >= 97 && cc0 <= 122)) &&
         (i === 0 || isWsCh(s[i - 1]) || isPunctCh(s[i - 1]))) {
-      const rest = s.slice(i);
-      const um = EXT_URL_RE.exec(rest);
+      const um = execAt(EXT_URL_RE_Y, s, i);
       if (um && (!um[0].startsWith('www.') || /www\.[^\s<]*\./.test(um[0]))) {
         const url = trimAutolink(um[0]);
         if (url.length >= 4) {
@@ -1815,18 +1842,26 @@ function parseInline(s, refs, state, extOff) {
       const prevCh = i === 0 ? null : s[i - 1];
       const prevHardBad = prevCh !== null && EMAIL_PREV_BAD.test(prevCh) &&
         prevCh !== '_' && prevCh !== '-';
-      if (!prevHardBad) {
+      // Both email patterns need an '@' right after a run of
+      // local-part characters; skip the regexes when that is
+      // impossible (the common case in prose).
+      let lpStart = i;
+      if (s.startsWith('mailto:', i) || s.startsWith('xmpp:', i)) lpStart = i + 7;
+      const atPos = s.indexOf('@', lpStart);
+      const emailOk = atPos !== -1 && (atPos - lpStart >= 80 ||
+        !/[^A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s.slice(lpStart, atPos)));
+      if (!prevHardBad && emailOk) {
         let text = null, href = null;
-        const sm = SCHEME_EMAIL_RE.exec(rest);
+        const sm = execAt(SCHEME_EMAIL_RE_Y, s, i);
         if (sm) {
           text = sm[0];
           if (sm[1] === 'xmpp' && s[i + text.length] === '/') {
-            const rm = /^\/[A-Za-z0-9@._~-]+/.exec(rest.slice(text.length));
+            const rm = execAt(XMPP_RES_RE_Y, s, i + text.length);
             if (rm) text += rm[0];
           }
           href = text;
         } else {
-          const em = EXT_EMAIL_RE.exec(rest);
+          const em = execAt(EXT_EMAIL_RE_Y, s, i);
           if (em) { text = em[0]; href = 'mailto:' + text; }
         }
         if (text !== null) {
@@ -1850,8 +1885,22 @@ function parseInline(s, refs, state, extOff) {
       }
     }
 
-    buf += ch;
-    i++;
+    // Bulk-consume a run of alphanumeric characters: only the first
+    // character of such a run can start an extended autolink (a later
+    // one is always preceded by an alphanumeric, which is neither
+    // whitespace nor punctuation), and none of them is an inline
+    // special character, so the whole run is plain text.
+    const ci = s.charCodeAt(i);
+    let j = i + 1;
+    if ((ci >= 48 && ci <= 57) || (ci >= 65 && ci <= 90) || (ci >= 97 && ci <= 122)) {
+      while (j < n) {
+        const cj = s.charCodeAt(j);
+        if (!((cj >= 48 && cj <= 57) || (cj >= 65 && cj <= 90) || (cj >= 97 && cj <= 122))) break;
+        j++;
+      }
+    }
+    buf += s.slice(i, j);
+    i = j;
   }
   flushText();
   processEmphasis(0);
@@ -1924,29 +1973,29 @@ function scanInlineLink(s, pos) {
 
 // Inline HTML: comment, processing instruction, declaration, CDATA, or a
 // syntactically valid open/close tag. Returns the raw string or null.
-function scanInlineHtml(rest) {
-  if (rest.startsWith('<!--')) {
-    if (rest.startsWith('<!-->')) return '<!-->';
-    if (rest.startsWith('<!--->')) return '<!--->';
-    const end = rest.indexOf('-->', 4);
+function scanInlineHtml(s, i) {
+  if (s.startsWith('<!--', i)) {
+    if (s.startsWith('<!-->', i)) return '<!-->';
+    if (s.startsWith('<!--->', i)) return '<!--->';
+    const end = s.indexOf('-->', i + 4);
     if (end === -1) return null;
-    const body = rest.slice(4, end);
-    if (body.endsWith('-')) return null;
-    return rest.slice(0, end + 3);
+    if (end > i + 4 && s[end - 1] === '-') return null;
+    return s.slice(i, end + 3);
   }
-  if (rest.startsWith('<?')) {
-    const end = rest.indexOf('?>', 2);
-    return end === -1 ? null : rest.slice(0, end + 2);
+  if (s.startsWith('<?', i)) {
+    const end = s.indexOf('?>', i + 2);
+    return end === -1 ? null : s.slice(i, end + 2);
   }
-  if (rest.startsWith('<![CDATA[')) {
-    const end = rest.indexOf(']]>', 9);
-    return end === -1 ? null : rest.slice(0, end + 3);
+  if (s.startsWith('<![CDATA[', i)) {
+    const end = s.indexOf(']]>', i + 9);
+    return end === -1 ? null : s.slice(i, end + 3);
   }
-  if (/^<![A-Za-z]/.test(rest)) {
-    const end = rest.indexOf('>', 2);
-    return end === -1 ? null : rest.slice(0, end + 1);
+  const c2 = s.charCodeAt(i + 2);
+  if (s[i + 1] === '!' && ((c2 >= 65 && c2 <= 90) || (c2 >= 97 && c2 <= 122))) {
+    const end = s.indexOf('>', i + 2);
+    return end === -1 ? null : s.slice(i, end + 1);
   }
-  const m = OPEN_TAG_RE.exec(rest) || CLOSE_TAG_RE.exec(rest);
+  const m = execAt(OPEN_TAG_RE_Y, s, i) || execAt(CLOSE_TAG_RE_Y, s, i);
   return m ? m[0] : null;
 }
 
