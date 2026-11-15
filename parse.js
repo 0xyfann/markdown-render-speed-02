@@ -569,26 +569,32 @@ function parseBlocks(src, refs) {
         }
         if (c - col <= 3 && rem[p] === '>') {
           p++; c++;
-          let tabbed = false;
-          if (rem[p] === ' ') { p++; c++; }
+          let expandBase = 0;
+          if (rem[p] === ' ') { p++; c++; expandBase = c - col; }
           else if (rem[p] === '\t') {
             // The tab fills the one optional space slot of the quote
             // prefix; the rest of its width becomes leading spaces of
             // the content, which then starts at its true column.
             const w = 4 - (c % 4);
             rem = ' '.repeat(w - 1) + rem.slice(p + 1);
+            expandBase = c + 1 - col;
             c += w;
-            tabbed = true;
+            curQuoteCols += c - col;
+            curLastQuoteW = c - col;
+            curLastStripW = c - col;
+            col = c;
+            rem = expandLeadingTabs(rem, expandBase);
+            continue;
           }
           curQuoteCols += c - col;
           curLastQuoteW = c - col;
           curLastStripW = c - col;
-          if (!tabbed) rem = rem.slice(p);
+          rem = rem.slice(p);
           col = c;
           // The quote's text is a fresh string: its lines' leading
           // tabs are expanded by their column in the parent text
           // (the width of this quote's strip).
-          rem = expandLeadingTabs(rem, curLastQuoteW);
+          rem = expandLeadingTabs(rem, expandBase);
         } else { matchedAll = false; break; }
       } else if (b.t === 'item') {
         if (b.sealed) { matchedAll = false; break; }
@@ -791,16 +797,18 @@ function parseBlocks(src, refs) {
         addChild(t, q);
         rest = base.slice(1);
         col = baseCol + 1;
-        if (rest[0] === ' ') { rest = rest.slice(1); col++; }
+        let expandBase = leadW + 1;
+        if (rest[0] === ' ') { rest = rest.slice(1); col++; expandBase = leadW + 2; }
         else if (rest[0] === '\t') {
           const w = 4 - (col % 4);
           rest = ' '.repeat(w - 1) + rest.slice(1);
+          expandBase = leadW + 2;
           col += w;
         }
         curQuoteCols += col - baseCol;
         curLastQuoteW = col - baseCol;
         curLastStripW = leadW + (col - baseCol);
-        rest = expandLeadingTabs(rest, curLastStripW);
+        rest = expandLeadingTabs(rest, expandBase);
         continue;
       }
 
