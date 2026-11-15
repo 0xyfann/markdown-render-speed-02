@@ -519,6 +519,7 @@ function parseBlocks(src, refs) {
     }
   }
 
+  let curQuoteCols = 0, curLastQuoteW = 0;
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li];
     curLi = li;
@@ -527,6 +528,7 @@ function parseBlocks(src, refs) {
     // -- Phase 1: match open containers.
     let rem = line;
     let col = 0;
+    curQuoteCols = 0; curLastQuoteW = 0;
     let depth = 1;
     let matchedAll = true;
     for (; depth < stack.length; depth++) {
@@ -549,6 +551,8 @@ function parseBlocks(src, refs) {
             rem = rem.slice(0, p) + ' '.repeat(w - 1) + rem.slice(p + 1);
             p++; c++;
           }
+          curQuoteCols += c - col;
+          curLastQuoteW = c - col;
           rem = rem.slice(p);
           col = c;
         } else { matchedAll = false; break; }
@@ -608,7 +612,7 @@ function parseBlocks(src, refs) {
           continue;
         }
         t.lines.push(codeContent(dropIndent(rem, t.fenceIndent || 0, col),
-          col + (t.fenceIndent || 0), stackBelowTipInContainer()));
+          col + (t.fenceIndent || 0) - Math.max(0, curQuoteCols - curLastQuoteW), stackBelowTipInContainer()));
         continue;
       }
     }
@@ -623,7 +627,8 @@ function parseBlocks(src, refs) {
       const leadW = countIndent(rem, col);
       const trimmedRest = rem.replace(/^[ \t]+/, '');
       if (tip().t === 'para' && (leadW > 3 || !interruptsParagraph(trimmedRest)) &&
-          !(leadW <= 3 && matchListMarker(trimmedRest) && stack.some((b) => b.t === 'item'))) {
+          !(leadW <= 3 && matchListMarker(trimmedRest) && stack.some((b) => b.t === 'item')) &&
+          !(leadW <= 3 && /^(`{3,}|~{3,})/.test(trimmedRest) && stack.some((b) => b.t === 'item'))) {
         let content = leadW >= 4 ? dropIndent(rem, 4, col) : rem;
         const para = tip();
         if (para.hasLazy && SETEXT_RE.test(content.trim())) content = '    ' + content;
@@ -671,6 +676,8 @@ function parseBlocks(src, refs) {
           rest = ' '.repeat(w - 1) + rest.slice(1);
           col++;
         }
+        curQuoteCols += col - baseCol;
+        curLastQuoteW = col - baseCol;
         continue;
       }
 
@@ -708,13 +715,13 @@ function parseBlocks(src, refs) {
         continue;
       }
       t.lines.push(codeContent(dropIndent(rest, t.fenceIndent || 0, col),
-        col + (t.fenceIndent || 0), stackBelowTipInContainer()));
+        col + (t.fenceIndent || 0) - Math.max(0, curQuoteCols - curLastQuoteW), stackBelowTipInContainer()));
       t.absorbArmed = true;
       continue;
     }
     if (t.t === 'code' && !t.fenced) {
       if (countIndent(rest, col) >= 4) {
-        t.lines.push(codeContent(dropIndent(rest, 4, col), col + 4, stackBelowTipInContainer()));
+        t.lines.push(codeContent(dropIndent(rest, 4, col), col + 4 - Math.max(0, curQuoteCols - curLastQuoteW), stackBelowTipInContainer()));
         continue;
       }
       finalizeTop(curLi - 1);
@@ -788,17 +795,20 @@ function parseBlocks(src, refs) {
     }
 
     // Tip is a container: start a leaf.
-    startLeaf(rest, col, stack, addChild, curLi, htmlBlocks);
+    startLeaf(rest, col, stack, addChild, curLi, htmlBlocks,
+      Math.max(0, curQuoteCols - curLastQuoteW));
   }
 
   closeDownTo(1);
   // HTML block trailing newline: for types 1-5 it is present when the line
-  // after the block is non-blank, or at EOF when the input ends with a
-  // newline; for types 6/7 only in that EOF position.
+  // after the block is not empty (a whitespace-only line still counts as
+  // a line), or at EOF when the input ends with a newline; for types 6/7
+  // only in that EOF position.
   for (const b of htmlBlocks) {
     const el = b.endLine !== undefined ? b.endLine : lines.length - 1;
     if (b.htmlType <= 5) {
-      b.trailingNL = el + 1 < lines.length ? !isBlank(lines[el + 1]) : endsWithNL;
+      const lastReal = endsWithNL ? lines.length - 2 : lines.length - 1;
+      b.trailingNL = el < lastReal ? lines[el + 1].length > 0 : endsWithNL;
     } else {
       b.trailingNL = el === lines.length - 1 && endsWithNL;
     }
@@ -825,14 +835,14 @@ function interruptsParagraph(rest) {
   return false;
 }
 
-function startLeaf(rest, col, stack, addChild, curLi, htmlBlocks) {
+function startLeaf(rest, col, stack, addChild, curLi, htmlBlocks, tabShift) {
   const parent = stack[stack.length - 1];
   const leadW = countIndent(rest, col);
 
   if (leadW >= 4) {
     const b = newBlock('code');
     b.fenced = false;
-    b.lines = [codeContent(dropIndent(rest, 4, col), col + 4,
+    b.lines = [codeContent(dropIndent(rest, 4, col), col + 4 - (tabShift || 0),
       stack.some((x) => x.t === 'item' || x.t === 'quote'))];
     addChild(parent, b);
     return;
