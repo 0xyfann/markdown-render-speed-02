@@ -1073,6 +1073,9 @@ function finishList(list) {
       lastBlock.text = lastBlock.text.replace(/[ \t]+$/, '');
       if (lastBlock.renderText !== undefined) lastBlock.renderText = lastBlock.renderText.replace(/[ \t]+$/, '');
     }
+    if (lastBlock.t === 'html') {
+      lastBlock.text = lastBlock.text.replace(/[ \t]+$/, '');
+    }
   }
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -1702,7 +1705,7 @@ function parseInline(s, refs, state, extOff) {
         flushText();
         nodes.push({ k: 'html', s: html });
         if (state) {
-          if (/^<a(?=[\s/>])/i.test(html)) state.inLink = true;
+          if (/^<a\s+[^>]*[^\s>][^>]*>/i.test(html)) state.inLink = true;
           else if (/^<\/a\s*>/i.test(html)) state.inLink = false;
         }
         i += html.length; continue;
