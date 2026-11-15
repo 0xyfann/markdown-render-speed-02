@@ -1272,6 +1272,8 @@ function parseInline(s, refs, state, extOff) {
   // a code span starts anywhere after its opener.
   let looseLinkPos = -1;
   const codeSpanStarts = [];
+  // Positions of '[' / '![' whose link/image attempt was not accepted.
+  const failedBrackets = [];
   let buf = '';
   let i = 0;
   const n = s.length;
@@ -1347,6 +1349,55 @@ function parseInline(s, refs, state, extOff) {
     return cursedRuns(rs, ch, 2, false, 0, cEnd);
   }
 
+  // Tolerant label scan used only to locate the region of a failed
+  // link: like scanLabel, but an unclosed backtick run is plain text.
+  function scanLabelLooseRegion(from) {
+    let depth = 0;
+    let j = from;
+    while (j < n) {
+      const c = s[j];
+      if (c === '\\' && j + 1 < n && isPunct(s[j + 1])) { j += 2; continue; }
+      if (c === '`') {
+        let run = 0;
+        while (s[j + run] === '`') run++;
+        let k = j + run;
+        while (k < n && s[k] !== '`') k++;
+        if (k < n) { while (s[k] === '`') k++; j = k; continue; }
+        j += run; continue;
+      }
+      if (c === '[') { depth++; j++; continue; }
+      if (c === ']') {
+        if (depth === 0) return j;
+        depth--; j++; continue;
+      }
+      j++;
+    }
+    return -1;
+  }
+
+  // Marked quirk: an emphasis span inside a failed [...](...) label
+  // does not form when its content holds a code span whose raw text
+  // itself contains a backtick.
+  function tickEmBlocked(op, closer) {
+    if (failedBrackets.length === 0) return false;
+    const oPos = nodes.indexOf(op.node);
+    const cPos = nodes.indexOf(closer.node);
+    if (oPos === -1 || cPos === -1) return false;
+    let hasTick = false;
+    for (let k = oPos + 1; k < cPos; k++) {
+      if (nodes[k].k === 'code' && nodes[k].tick) { hasTick = true; break; }
+    }
+    if (!hasTick) return false;
+    for (const fb of failedBrackets) {
+      const labelStart = fb.pos + (fb.image ? 2 : 1);
+      if (labelStart > op.srcStart) continue;
+      const labelEnd = scanLabelLooseRegion(labelStart);
+      if (labelEnd === -1) continue;
+      if (closer.srcEnd <= labelEnd && s[labelEnd + 1] === '(') return true;
+    }
+    return false;
+  }
+
   // Delimiter processing over delims[bottom..], the standard algorithm.
   function processEmphasis(bottom) {
     let closerIdx = bottom;
@@ -1369,6 +1420,7 @@ function parseInline(s, refs, state, extOff) {
           if (emphasisBlocked(op, closer, use)) continue;
           if (looseLinkPos !== -1 && looseLinkPos < op.srcStart &&
               codeSpanStarts.some((cs) => cs > op.srcStart)) continue;
+          if (tickEmBlocked(op, closer)) continue;
         }
         openerIdx = j;
         break;
@@ -1546,7 +1598,7 @@ function parseInline(s, refs, state, extOff) {
         content = content.slice(1, -1);
       }
       flushText();
-      nodes.push({ k: 'code', s: content });
+      nodes.push({ k: 'code', s: content, tick: run >= 2 && s.slice(i + run, found).includes('`') });
       codeSpanStarts.push(i);
       i = found + run;
       continue;
@@ -1599,6 +1651,7 @@ function parseInline(s, refs, state, extOff) {
         if (m.loose && looseLinkPos === -1) looseLinkPos = i;
         i = m.end; continue;
       }
+      failedBrackets.push({ pos: i, image: true });
       buf += '!'; i++; continue;
     }
 
@@ -1615,6 +1668,7 @@ function parseInline(s, refs, state, extOff) {
           i = m.end; continue;
         }
       }
+      failedBrackets.push({ pos: i, image: false });
       buf += '['; i++; continue;
     }
 
