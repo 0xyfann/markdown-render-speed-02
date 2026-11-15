@@ -1267,6 +1267,11 @@ function parseInline(s, refs, state, extOff) {
   const nodes = [];
   const delims = [];   // {node, ch, canOpen, canClose}; node.len is live
   const allDelims = []; // every delim entry ever created here (stable spans)
+  // Marked quirk: once a link whose label used an unequal-run loose
+  // backtick span has appeared, a later emphasis span is refused when
+  // a code span starts anywhere after its opener.
+  let looseLinkPos = -1;
+  const codeSpanStarts = [];
   let buf = '';
   let i = 0;
   const n = s.length;
@@ -1362,6 +1367,8 @@ function parseInline(s, refs, state, extOff) {
           if (odd) continue;
           const use = op.node.len >= 2 && closer.node.len >= 2 ? 2 : 1;
           if (emphasisBlocked(op, closer, use)) continue;
+          if (looseLinkPos !== -1 && looseLinkPos < op.srcStart &&
+              codeSpanStarts.some((cs) => cs > op.srcStart)) continue;
         }
         openerIdx = j;
         break;
@@ -1409,6 +1416,11 @@ function parseInline(s, refs, state, extOff) {
     }
   }
 
+  // Side channel: set by scanLabel when the label it scanned used a
+  // loose code span whose closing backtick run differs in length from
+  // its opener.
+  let scanLoose = false;
+
   // Scan a link label starting just after the opening bracket, using
   // marked's label grammar: plain characters, backslash escapes, nested
   // bracket groups, and loose code spans (a backtick run, non-backtick
@@ -1432,8 +1444,10 @@ function parseInline(s, refs, state, extOff) {
         let k = j + run;
         while (k < n && s[k] !== '`') k++;
         if (k < n) {
-          while (s[k] === '`') k++;
-          j = k; continue;
+          let closeRun = 0;
+          while (s[k + closeRun] === '`') closeRun++;
+          if (closeRun !== run) scanLoose = true;
+          j = k + closeRun; continue;
         }
         return -1;
       }
@@ -1467,29 +1481,32 @@ function parseInline(s, refs, state, extOff) {
   // tokenized once the whole construct resolves.
   function matchLinkAt(pos, isImage) {
     const labelStart = pos + (isImage ? 2 : 1);
+    scanLoose = false;
     const labelEnd = scanLabel(labelStart);
     if (labelEnd === -1) return null;
+    const loose = scanLoose;
     const labelText = s.slice(labelStart, labelEnd);
     const after = labelEnd + 1;
     if (s[after] === '(') {
       const r = scanInlineLink(s, after);
-      if (r) return { href: r.href, title: r.title, end: r.end, labelText };
+      if (r) return { href: r.href, title: r.title, end: r.end, labelText, loose };
       // An invalid (...) part falls back to the shortcut reference.
       const d = refs.get(normalizeLabel(labelText));
-      if (d) return { href: d.href, title: d.title, end: after, labelText };
+      if (d) return { href: d.href, title: d.title, end: after, labelText, loose };
       return null;
     }
     if (s[after] === '[') {
+      scanLoose = false;
       const refEnd = scanLabel(after + 1);
       if (refEnd !== -1) {
         const refText = s.slice(after + 1, refEnd);
         const d = refs.get(normalizeLabel(refText === '' ? labelText : refText));
-        if (d) return { href: d.href, title: d.title, end: refEnd + 1, labelText };
+        if (d) return { href: d.href, title: d.title, end: refEnd + 1, labelText, loose: loose || scanLoose };
         return null; // a bracketed label that does not resolve binds
       }
     }
     const d = refs.get(normalizeLabel(labelText));
-    if (d) return { href: d.href, title: d.title, end: after, labelText };
+    if (d) return { href: d.href, title: d.title, end: after, labelText, loose };
     return null;
   }
 
@@ -1530,6 +1547,7 @@ function parseInline(s, refs, state, extOff) {
       }
       flushText();
       nodes.push({ k: 'code', s: content });
+      codeSpanStarts.push(i);
       i = found + run;
       continue;
     }
@@ -1578,6 +1596,7 @@ function parseInline(s, refs, state, extOff) {
         flushText();
         const inner = parseInline(m.labelText, refs, state, extOff);
         nodes.push({ k: 'img', href: m.href, title: m.title, children: inner });
+        if (m.loose && looseLinkPos === -1) looseLinkPos = i;
         i = m.end; continue;
       }
       buf += '!'; i++; continue;
@@ -1592,6 +1611,7 @@ function parseInline(s, refs, state, extOff) {
         if (!containsBracketLink(inner)) {
           flushText();
           nodes.push({ k: 'link', href: m.href, title: m.title, children: inner });
+          if (m.loose && looseLinkPos === -1) looseLinkPos = i;
           i = m.end; continue;
         }
       }
