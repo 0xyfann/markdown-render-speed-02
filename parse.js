@@ -1266,6 +1266,7 @@ function containsBracketLink(list) {
 function parseInline(s, refs, state, extOff) {
   const nodes = [];
   const delims = [];   // {node, ch, canOpen, canClose}; node.len is live
+  const allDelims = []; // every delim entry ever created here (stable spans)
   let buf = '';
   let i = 0;
   const n = s.length;
@@ -1275,6 +1276,70 @@ function parseInline(s, refs, state, extOff) {
       nodes.push({ k: 't', s: buf });
       buf = '';
     }
+  }
+
+  // Marked's em/strong matcher rejects a span whose content holds a
+  // delimiter pair (single runs for a strong span, double runs for an
+  // em span) that starts after whitespace and whose closer is glued to
+  // a following letter — unless a later run that could itself close a
+  // span rescues it (strong spans only). Only real delimiter runs
+  // count; delimiter chars inside code spans, links and other tokens
+  // are invisible to the matcher. `rs` is the list of the span's
+  // content runs (entries from allDelims), `extra` is a count of
+  // delimiter chars borrowed from the closer run at the span's end.
+  function cursedRuns(rs, ch, plen, rescue, extra, cEnd) {
+    const prs = rs.filter((r) => plen === 1 ? r.origLen === 1 : r.origLen >= 2);
+    if (prs.length < 2) return false;
+    let p = -1, q = -1;
+    for (let i = 0; i < prs.length; i++) {
+      const r = prs[i];
+      const next = s[r.srcEnd];
+      const prev = r.srcStart > 0 ? s[r.srcStart - 1] : undefined;
+      if (p < 0 && !isWsCh(next)) { p = i; continue; }
+      if (p >= 0 && !isWsCh(prev)) { q = i; break; }
+    }
+    if (p < 0 || q < 0) return false;
+    const pPrev = prs[p].srcStart > 0 ? s[prs[p].srcStart - 1] : undefined;
+    const qNext = s[prs[q].srcEnd];
+    if (!(pPrev === undefined || isWsCh(pPrev))) return false;
+    if (!(qNext !== undefined && !isWsCh(qNext) && qNext !== ch)) return false;
+    if (rescue) {
+      for (const r of rs) {
+        if (r.srcStart <= prs[q].srcStart) continue;
+        const prev = s[r.srcStart - 1];
+        const next = s[r.srcEnd];
+        if (prev !== undefined && !isWsCh(prev) && prev !== ch &&
+            (next === undefined || isWsCh(next))) return false;
+      }
+      // Borrowed closer stars form one more run at the very end:
+      // preceded by the content's last char, followed by nothing.
+      if (extra > 0) {
+        const prev = cEnd > 0 ? s[cEnd - 1] : undefined;
+        if (prev !== undefined && !isWsCh(prev) && prev !== ch) return false;
+      }
+    }
+    return true;
+  }
+
+  // Whether marked's matcher refuses this opener/closer pairing.
+  function emphasisBlocked(op, closer, use) {
+    const ch = closer.ch;
+    const cEnd = closer.srcStart + (closer.origLen - closer.node.len);
+    const rs = allDelims.filter((d) => d.ch === ch && d.srcStart >= op.srcEnd && d.srcEnd <= cEnd);
+    if (use === 2) {
+      const extra = Math.max(0, closer.node.len - 2);
+      return cursedRuns(rs, ch, 1, true, extra, cEnd);
+    }
+    if (op.origLen >= 2) {
+      // A single-star match against a multi-star opener is refused
+      // when a both-flanking run of the same char sits between them.
+      for (const r of rs) {
+        const prev = s[r.srcStart - 1];
+        const next = s[r.srcEnd];
+        if (!isWsCh(prev) && !isWsCh(next) && prev !== ch && next !== ch) return true;
+      }
+    }
+    return cursedRuns(rs, ch, 2, false, 0, cEnd);
   }
 
   // Delimiter processing over delims[bottom..], the standard algorithm.
@@ -1295,6 +1360,8 @@ function parseInline(s, refs, state, extOff) {
             (op.node.len + closer.node.len) % 3 === 0 &&
             !(op.node.len % 3 === 0 && closer.node.len % 3 === 0);
           if (odd) continue;
+          const use = op.node.len >= 2 && closer.node.len >= 2 ? 2 : 1;
+          if (emphasisBlocked(op, closer, use)) continue;
         }
         openerIdx = j;
         break;
@@ -1533,7 +1600,9 @@ function parseInline(s, refs, state, extOff) {
       flushText();
       const node = { k: 'delim', ch, len: run };
       nodes.push(node);
-      delims.push({ node, ch, canOpen, canClose });
+      const dEntry = { node, ch, canOpen, canClose, srcStart: i, srcEnd: i + run, origLen: run };
+      delims.push(dEntry);
+      allDelims.push(dEntry);
       i += run;
       continue;
     }
