@@ -928,8 +928,17 @@ function parseBlocks(src, refs) {
       }
       // A paragraph line inside a container has its leading tabs
       // expanded as if the line started at the last container's strip
-      // width (marked re-lexes container text level by level).
-      t.text += '\n' + (stack.length > 2 ? expandLeadingTabs(rest, curLastStripW) : rest);
+      // width (marked re-lexes container text level by level). Inside
+      // a list item, a continuation line whose remaining indent is 4+
+      // columns sheds exactly 4 of them.
+      let contText = rest;
+      if (stack.length > 2) {
+        if (stack.slice(0, -1).some((b) => b.t === 'item') && countIndent(rest, col) >= 4) {
+          contText = dropIndent(rest, 4, col);
+        }
+        contText = expandLeadingTabs(contText, curLastStripW);
+      }
+      t.text += '\n' + contText;
       continue;
     }
 
@@ -1309,13 +1318,13 @@ function parseInline(s, refs, state, extOff) {
     const pPrev = prs[p].srcStart > 0 ? s[prs[p].srcStart - 1] : undefined;
     const qNext = s[prs[q].srcEnd];
     if (!(pPrev === undefined || isWsCh(pPrev))) return false;
-    if (!(qNext !== undefined && !isWsCh(qNext) && qNext !== ch)) return false;
+    if (!(qNext !== undefined && !isWsCh(qNext) && qNext !== '*' && qNext !== '_' && qNext !== '~')) return false;
     if (rescue) {
       for (const r of rs) {
         if (r.srcStart <= prs[q].srcStart) continue;
         const prev = s[r.srcStart - 1];
         const next = s[r.srcEnd];
-        if (prev !== undefined && !isWsCh(prev) && prev !== ch &&
+        if (prev !== undefined && !isWsCh(prev) && prev !== '*' && prev !== '_' && prev !== '~' &&
             (next === undefined || isWsCh(next))) return false;
       }
       // Borrowed closer stars form one more run at the very end:
