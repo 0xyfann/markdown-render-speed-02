@@ -429,14 +429,21 @@ function parseBlocks(src, refs) {
     return false;
   }
 
-  function finalizeTop(endLine) {
+  function finalizeTop(endLine, closingDepth) {
+    const parentIdx = stack.length - 2;
     const b = stack.pop();
     b.open = false;
     if (b.t === 'para') {
       b.renderText = extractDefs(b.text, refs);
       b.defsOnly = b.renderText.trim() === '';
     }
-    if (b.t === 'html') b.endLine = endLine !== undefined ? endLine : curLi;
+    if (b.t === 'html') {
+      b.endLine = endLine !== undefined ? endLine : curLi;
+      // Marked lexes each container's text separately: an HTML block
+      // that ends together with an ancestor container is at the end of
+      // that text and takes no trailing newline.
+      b.endOfText = closingDepth !== undefined && closingDepth <= parentIdx;
+    }
     if (b.t === 'code') {
       let ls = b.lines || [];
       if (!b.fenced) {
@@ -454,7 +461,7 @@ function parseBlocks(src, refs) {
   }
 
   function closeDownTo(depth, endLine) {
-    while (stack.length - 1 >= depth) finalizeTop(endLine);
+    while (stack.length - 1 >= depth) finalizeTop(endLine, depth);
   }
 
   function addChild(parent, b) {
@@ -952,12 +959,22 @@ function parseBlocks(src, refs) {
   }
 
   closeDownTo(1);
+  // An HTML block that is the last child of an item or quote sits at
+  // the end of that container's text: no trailing newline (this also
+  // covers single-line blocks finalized in place in startLeaf).
+  (function markEndOfText(b) {
+    if (!b.children) return;
+    for (const c of b.children) markEndOfText(c);
+    const last = b.children[b.children.length - 1];
+    if (last && last.t === 'html' && (b.t === 'item' || b.t === 'quote')) last.endOfText = true;
+  })(root);
   // HTML block trailing newline: for types 1-5 it is present when the line
   // after the block is not empty (a whitespace-only line still counts as
   // a line), or at EOF when the input ends with a newline; for types 6/7
   // only in that EOF position.
   for (const b of htmlBlocks) {
     const el = b.endLine !== undefined ? b.endLine : lines.length - 1;
+    if (b.endOfText) { b.trailingNL = false; continue; }
     if (b.htmlType <= 5) {
       const lastReal = endsWithNL ? lines.length - 2 : lines.length - 1;
       b.trailingNL = el < lastReal ? lines[el + 1].length > 0 : endsWithNL;
