@@ -466,16 +466,16 @@ function parseBlocks(src, refs) {
   // list remembers that its current item saw a blank after content (a
   // following sibling makes the list loose), and a still-empty innermost
   // item is sealed (marked ends an empty item at a blank line).
-  function noteBlankLine() {
+  function noteBlankLine(minDepth) {
     let innermost = null;
-    for (let d = stack.length - 1; d >= 1; d--) {
+    for (let d = stack.length - 1; d > minDepth; d--) {
       const b = stack[d];
       if (b.t === 'item') {
         b.pendingBlank = true;
         if (!innermost) innermost = { item: b, depth: d };
       }
     }
-    for (let d = 1; d < stack.length; d++) {
+    for (let d = minDepth + 1; d < stack.length; d++) {
       if (stack[d].t === 'list') stack[d].blankSepPending = true;
     }
     if (innermost) {
@@ -491,7 +491,7 @@ function parseBlocks(src, refs) {
   // absorb the line; paragraphs/tables/html(6,7) end; a raw blank line
   // (nothing consumed it) also ends every open blockquote, as marked's
   // blockquote chunks stop at blank lines.
-  function blankLine(rem, col, matchedAll, rawBlank, quoteMatched) {
+  function blankLine(rem, col, matchedAll, rawBlank, quoteMatched, scopeDepth) {
     const t = tip();
     if (matchedAll && t.t === 'code') {
       t.lines.push(t.fenced ? dropIndent(rem, t.fenceIndent || 0, col) : dropIndent(rem, 4, col));
@@ -515,7 +515,11 @@ function parseBlocks(src, refs) {
       for (let d = 1; d < stack.length; d++) {
         if (stack[d].t === 'quote') { closeDownTo(d, curLi - 1); break; }
       }
-      noteBlankLine();
+      noteBlankLine(0);
+    } else if (scopeDepth > 0) {
+      // A blank line inside a blockquote is a real blank line for the
+      // lists and items inside that quote (looseness, sealing).
+      noteBlankLine(scopeDepth);
     }
   }
 
@@ -582,7 +586,11 @@ function parseBlocks(src, refs) {
       for (let d = 1; d < matchedDepth && d < stack.length; d++) {
         if (stack[d].t === 'quote') quoteMatched = true;
       }
-      blankLine(rem, col, matchedAll, rawBlank, quoteMatched);
+      let scopeDepth = 0;
+      for (let d = matchedDepth - 1; d >= 1; d--) {
+        if (stack[d].t === 'quote') { scopeDepth = d; break; }
+      }
+      blankLine(rem, col, matchedAll, rawBlank, quoteMatched, scopeDepth);
       continue;
     }
 
@@ -700,7 +708,11 @@ function parseBlocks(src, refs) {
     }
 
     if (rest.trim() === '') {
-      blankLine(rest, col, true, false, stack.some((b) => b.t === 'quote'));
+      let scopeDepth2 = 0;
+      for (let d = stack.length - 1; d >= 1; d--) {
+        if (stack[d].t === 'quote') { scopeDepth2 = d; break; }
+      }
+      blankLine(rest, col, true, false, stack.some((b) => b.t === 'quote'), scopeDepth2);
       continue;
     }
 
@@ -888,6 +900,13 @@ function startLeaf(rest, col, stack, addChild, curLi, htmlBlocks, tabShift) {
 function finishList(list) {
   let loose = !!list.loose;
   const items = list.children;
+  // The last item's text ends at the list's raw end, which marked
+  // trims: a trailing paragraph there loses its trailing spaces/tabs.
+  const lastItem = items[items.length - 1];
+  if (lastItem && lastItem.children.length) {
+    const lastBlock = lastItem.children[lastItem.children.length - 1];
+    if (lastBlock.t === 'para') lastBlock.text = lastBlock.text.replace(/[ \t]+$/, '');
+  }
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     for (let j = 1; j < item.children.length; j++) {
@@ -1371,8 +1390,8 @@ function parseInline(s, refs, state, extOff) {
         canOpen = leftFlank && (!rightFlank || isPunctCh(prev));
         canClose = rightFlank && (!leftFlank || isPunctCh(next));
       } else {
-        canOpen = !isWsCh(next) && next !== '~';
-        canClose = !isWsCh(prev) && prev !== '~';
+        canOpen = !isWsCh(next);
+        canClose = !isWsCh(prev);
       }
       flushText();
       const node = { k: 'delim', ch, len: run };
@@ -1561,6 +1580,11 @@ function scanInlineHtml(rest) {
 // Trim an extended autolink per GFM rules.
 function trimAutolink(url) {
   let u = url;
+  // An '(' with no ')' anywhere after it (within the match) ends the
+  // URL just before it.
+  for (let i = 0; i < u.length; i++) {
+    if (u[i] === '(' && u.indexOf(')', i) === -1) { u = u.slice(0, i); break; }
+  }
   for (;;) {
     const before = u;
     const last = u[u.length - 1];
@@ -1569,9 +1593,15 @@ function trimAutolink(url) {
     else if (last !== undefined && '?!.,:*_~'.includes(last)) u = u.slice(0, -1);
     else if (last === ';') u = u.slice(0, -1);
     else if (last === ')') {
-      let open = 0, close = 0;
-      for (const c of u) { if (c === '(') open++; else if (c === ')') close++; }
-      if (close > open) u = u.slice(0, -1);
+      // The final ')' is dropped when it matches nothing, or when the
+      // group it closes itself contains a '('; a simple group stays.
+      const stack = [];
+      let match = -1;
+      for (let i = 0; i < u.length; i++) {
+        if (u[i] === '(') stack.push(i);
+        else if (u[i] === ')') match = stack.length ? stack.pop() : -1;
+      }
+      if (match === -1 || u.slice(match + 1, -1).includes('(')) u = u.slice(0, -1);
     }
     if (u === before) break;
   }
