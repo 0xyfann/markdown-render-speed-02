@@ -177,6 +177,20 @@ function countIndent(line, startCol) {
 
 // Remove exactly `cols` columns of indentation; a partially consumed tab
 // leaves the remaining width as spaces.
+// Marked removes a fence's indent from content lines by counting
+// whitespace characters (a tab counts once), not columns.
+function dropChars(line, n, startCol) {
+  let col = startCol || 0;
+  let i = 0;
+  while (i < line.length && n > 0) {
+    const ch = line[i];
+    if (ch === ' ') { col++; i++; n--; }
+    else if (ch === '\t') { col += 4 - (col % 4); i++; n--; }
+    else break;
+  }
+  return [line.slice(i), col];
+}
+
 function dropIndent(line, cols, startCol) {
   let col = startCol || 0;
   const target = col + cols;
@@ -500,7 +514,7 @@ function parseBlocks(src, refs) {
     }
     const t = tip();
     if (matchedAll && t.t === 'code') {
-      t.lines.push(t.fenced ? dropIndent(rem, t.fenceIndent || 0, col) : dropIndent(rem, 4, col));
+      t.lines.push(t.fenced ? dropChars(rem, t.fenceIndent || 0, col)[0] : dropIndent(rem, 4, col));
       if (t.fenced) t.absorbArmed = false;
       return;
     }
@@ -529,7 +543,7 @@ function parseBlocks(src, refs) {
     }
   }
 
-  let curQuoteCols = 0, curLastQuoteW = 0;
+  let curQuoteCols = 0, curLastQuoteW = 0, curLastStripW = 0;
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li];
     curLi = li;
@@ -538,7 +552,7 @@ function parseBlocks(src, refs) {
     // -- Phase 1: match open containers.
     let rem = line;
     let col = 0;
-    curQuoteCols = 0; curLastQuoteW = 0;
+    curQuoteCols = 0; curLastQuoteW = 0; curLastStripW = 0;
     let depth = 1;
     let matchedAll = true;
     const remSnap = [line], colSnap = [0];
@@ -555,18 +569,26 @@ function parseBlocks(src, refs) {
         }
         if (c - col <= 3 && rem[p] === '>') {
           p++; c++;
+          let tabbed = false;
           if (rem[p] === ' ') { p++; c++; }
           else if (rem[p] === '\t') {
-            // The tab counts as a single column of the quote prefix; the
-            // rest of its width becomes leading spaces of the content.
+            // The tab fills the one optional space slot of the quote
+            // prefix; the rest of its width becomes leading spaces of
+            // the content, which then starts at its true column.
             const w = 4 - (c % 4);
-            rem = rem.slice(0, p) + ' '.repeat(w - 1) + rem.slice(p + 1);
-            p++; c++;
+            rem = ' '.repeat(w - 1) + rem.slice(p + 1);
+            c += w;
+            tabbed = true;
           }
           curQuoteCols += c - col;
           curLastQuoteW = c - col;
-          rem = rem.slice(p);
+          curLastStripW = c - col;
+          if (!tabbed) rem = rem.slice(p);
           col = c;
+          // The quote's text is a fresh string: its lines' leading
+          // tabs are expanded by their column in the parent text
+          // (the width of this quote's strip).
+          rem = expandLeadingTabs(rem, curLastQuoteW);
         } else { matchedAll = false; break; }
       } else if (b.t === 'item') {
         if (b.sealed) { matchedAll = false; break; }
@@ -574,6 +596,7 @@ function parseBlocks(src, refs) {
         if (!r.ok) { matchedAll = false; break; }
         rem = r.rest;
         col += b.indent;
+        curLastStripW = b.indent;
       } else if (b.t === 'list') {
         // Lists impose no prefix of their own.
       } else {
@@ -639,8 +662,8 @@ function parseBlocks(src, refs) {
         for (let d = stack.length - 2; d >= 1; d--) {
           if (stack[d].t === 'list') { stack[d].detached = true; break; }
         }
-        t.lines.push(codeContent(dropIndent(simRem, t.fenceIndent || 0, simCol),
-          simCol + (t.fenceIndent || 0), stackBelowTipInContainer()));
+        const simDrop = dropChars(simRem, t.fenceIndent || 0, simCol);
+        t.lines.push(codeContent(simDrop[0], simDrop[1], stackBelowTipInContainer()));
         t.absorbArmed = true;
         continue;
       }
@@ -668,7 +691,7 @@ function parseBlocks(src, refs) {
       // break still ends the item instead (item-only failures).
       let ok = false;
       let quoteFailed = false;
-      let dropCols = tip().fenceIndent || 0;
+      let itemDrop = 0;
       let fenceItemDepth = -1;
       for (let d = stack.length - 2; d >= 1; d--) if (stack[d].t === 'item') { fenceItemDepth = d; break; }
       if (fenceItemDepth >= 0) {
@@ -681,7 +704,7 @@ function parseBlocks(src, refs) {
             if (d < fenceItemDepth) quoteFailed = true;
             else { ok = false; break; }
           }
-          else if (bt === 'item') dropCols += stack[d].indent;
+          else if (bt === 'item') itemDrop += stack[d].indent;
           else if (bt !== 'list') { ok = false; break; }
         }
       }
@@ -703,10 +726,12 @@ function parseBlocks(src, refs) {
         if (SETEXT_RE.test(trimmedRem)) {
           // A setext-looking absorbed line is shielded with 4 spaces at
           // the item-text level (before the fence's own indent drop).
-          t.lines.push(dropIndent('    ' + trimmedRem, t.fenceIndent || 0, 0));
+          t.lines.push(dropChars('    ' + trimmedRem, t.fenceIndent || 0, 0)[0]);
         } else {
-          t.lines.push(codeContent(dropIndent(rem, dropCols, col),
-            col + dropCols - Math.max(0, curQuoteCols - curLastQuoteW), stackBelowTipInContainer()));
+          const afterItems = dropIndent(rem, itemDrop, col);
+          const afterFence = dropChars(afterItems, t.fenceIndent || 0, col + itemDrop);
+          t.lines.push(codeContent(afterFence[0],
+            afterFence[1] - Math.max(0, curQuoteCols - curLastQuoteW), stackBelowTipInContainer()));
         }
         continue;
       }
@@ -726,6 +751,7 @@ function parseBlocks(src, refs) {
           !(leadW <= 3 && /^(`{3,}|~{3,})/.test(trimmedRest) && stack.some((b) => b.t === 'item'))) {
         let content = leadW >= 4 ? dropIndent(rem, 4, col) : rem;
         const para = tip();
+        if (leadW < 4) content = expandLeadingTabs(content, curLastStripW);
         if (para.hasLazy && SETEXT_RE.test(content.trim())) content = '    ' + content;
         para.hasLazy = true;
         para.text += '\n' + content;
@@ -769,10 +795,12 @@ function parseBlocks(src, refs) {
         else if (rest[0] === '\t') {
           const w = 4 - (col % 4);
           rest = ' '.repeat(w - 1) + rest.slice(1);
-          col++;
+          col += w;
         }
         curQuoteCols += col - baseCol;
         curLastQuoteW = col - baseCol;
+        curLastStripW = leadW + (col - baseCol);
+        rest = expandLeadingTabs(rest, curLastStripW);
         continue;
       }
 
@@ -813,8 +841,9 @@ function parseBlocks(src, refs) {
         finalizeTop();
         continue;
       }
-      t.lines.push(codeContent(dropIndent(rest, t.fenceIndent || 0, col),
-        col + (t.fenceIndent || 0) - Math.max(0, curQuoteCols - curLastQuoteW), stackBelowTipInContainer()));
+      const fenceDrop = dropChars(rest, t.fenceIndent || 0, col);
+      t.lines.push(codeContent(fenceDrop[0],
+        fenceDrop[1] - Math.max(0, curQuoteCols - curLastQuoteW), stackBelowTipInContainer()));
       t.absorbArmed = true;
       continue;
     }
@@ -889,13 +918,16 @@ function parseBlocks(src, refs) {
         li--; // reprocess this line from scratch against the new stack
         continue;
       }
-      t.text += '\n' + rest;
+      // A paragraph line inside a container has its leading tabs
+      // expanded as if the line started at the last container's strip
+      // width (marked re-lexes container text level by level).
+      t.text += '\n' + (stack.length > 2 ? expandLeadingTabs(rest, curLastStripW) : rest);
       continue;
     }
 
     // Tip is a container: start a leaf.
     startLeaf(rest, col, stack, addChild, curLi, htmlBlocks,
-      Math.max(0, curQuoteCols - curLastQuoteW));
+      Math.max(0, curQuoteCols - curLastQuoteW), curLastStripW);
   }
 
   closeDownTo(1);
@@ -934,11 +966,15 @@ function interruptsParagraph(rest) {
   return false;
 }
 
-function startLeaf(rest, col, stack, addChild, curLi, htmlBlocks, tabShift) {
+function startLeaf(rest, col, stack, addChild, curLi, htmlBlocks, tabShift, stripW) {
   const parent = stack[stack.length - 1];
   const leadW = countIndent(rest, col);
+  // Indented-code status is judged in the innermost container's own
+  // text coordinates: a tab's width counts from the last strip width,
+  // not from the document column.
+  const leadWText = stripW !== undefined ? countIndent(rest, stripW) : leadW;
 
-  if (leadW >= 4) {
+  if (leadWText >= 4) {
     const b = newBlock('code');
     b.fenced = false;
     b.lines = [codeContent(dropIndent(rest, 4, col), col + 4 - (tabShift || 0),
@@ -949,7 +985,9 @@ function startLeaf(rest, col, stack, addChild, curLi, htmlBlocks, tabShift) {
   const after = dropIndent(rest, leadW, col);
   const fence = matchFence(after);
   if (fence) {
-    fence.fenceIndent = leadW;
+    // Marked strips the opening fence's indent from backtick-fence
+    // content lines, but tilde-fence content is kept verbatim.
+    fence.fenceIndent = fence.fenceCh === '~' ? 0 : leadW;
     addChild(parent, fence);
     return;
   }
@@ -980,7 +1018,8 @@ function startLeaf(rest, col, stack, addChild, curLi, htmlBlocks, tabShift) {
     return;
   }
   const para = newBlock('para');
-  para.text = rest;
+  para.text = (parent.t === 'quote' || parent.t === 'item') && stripW !== undefined
+    ? expandLeadingTabs(rest, stripW) : rest;
   addChild(parent, para);
 }
 
@@ -992,7 +1031,10 @@ function finishList(list) {
   const lastItem = items[items.length - 1];
   if (lastItem && lastItem.children.length) {
     const lastBlock = lastItem.children[lastItem.children.length - 1];
-    if (lastBlock.t === 'para') lastBlock.text = lastBlock.text.replace(/[ \t]+$/, '');
+    if (lastBlock.t === 'para') {
+      lastBlock.text = lastBlock.text.replace(/[ \t]+$/, '');
+      if (lastBlock.renderText !== undefined) lastBlock.renderText = lastBlock.renderText.replace(/[ \t]+$/, '');
+    }
   }
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
