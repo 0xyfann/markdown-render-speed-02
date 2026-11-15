@@ -574,9 +574,11 @@ function parseBlocks(src, refs) {
           else if (rem[p] === '\t') {
             // The tab fills the one optional space slot of the quote
             // prefix; the rest of its width becomes leading spaces of
-            // the content, which then starts at its true column.
+            // the content. The width is set by the tab's column in the
+            // parent text (c - col), not its raw line column.
             const w = 4 - (c % 4);
-            rem = ' '.repeat(w - 1) + rem.slice(p + 1);
+            const wText = 4 - ((c - col) % 4);
+            rem = ' '.repeat(wText - 1) + rem.slice(p + 1);
             expandBase = c + 1 - col;
             c += w;
             curQuoteCols += c - col;
@@ -800,7 +802,9 @@ function parseBlocks(src, refs) {
         let expandBase = leadW + 1;
         if (rest[0] === ' ') { rest = rest.slice(1); col++; expandBase = leadW + 2; }
         else if (rest[0] === '\t') {
-          const w = 4 - (col % 4);
+          // The tab's width is set by its column in the current
+          // container text (leadW spaces + the '>' itself).
+          const w = 4 - ((leadW + 1) % 4);
           rest = ' '.repeat(w - 1) + rest.slice(1);
           expandBase = leadW + 2;
           col += w;
