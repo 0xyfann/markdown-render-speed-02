@@ -1377,9 +1377,28 @@ function parseInline(s, refs, state, extOff) {
       const cPos = nodes.indexOf(closer.node);
       const inner = nodes.splice(oPos + 1, cPos - oPos - 1);
       const kind = closer.ch === '~' ? 'del' : use === 2 ? 'strong' : 'em';
+      // A strong match against a closing run of 3+ spends one extra
+      // star inside the span when the content ends with a delimiter
+      // pair glued to the final word.
+      let bonus = 0;
+      if (use === 2 && closer.node.len > 2 && closer.ch !== '~') {
+        let earlierOpener = false;
+        for (let j = bottom; j < openerIdx; j++) {
+          if (delims[j].ch === closer.ch && delims[j].canOpen && delims[j].node.len > 0) { earlierOpener = true; break; }
+        }
+        let q = null;
+        for (const d of allDelims) {
+          if (d.ch === closer.ch && d.srcStart >= opener.srcEnd && d.srcEnd <= closer.srcStart) q = d;
+        }
+        if (!earlierOpener && q) {
+          const tail = s.slice(q.srcEnd, closer.srcStart);
+          if (tail !== '' && !/\s/.test(tail) && !tail.includes(closer.ch)) bonus = 1;
+        }
+      }
+      if (bonus) inner.push({ k: 't', s: closer.ch });
       nodes.splice(oPos + 1, 0, { k: kind, children: inner });
       opener.node.len -= use;
-      closer.node.len -= use;
+      closer.node.len -= use + bonus;
       for (let j = closerIdx - 1; j > openerIdx; j--) delims.splice(j, 1);
       closerIdx = openerIdx + 1;
       if (opener.node.len === 0) {
