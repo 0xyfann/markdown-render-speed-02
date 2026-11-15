@@ -73,7 +73,9 @@ function escapeAttr(s) {
   return out;
 }
 
-// Escape for code blocks / code spans (same entity set in marked).
+// Code content inside a container (list item / block quote): a leading
+// whitespace run containing a tab is re-rendered as spaces, computed by
+// absolute column. Outside containers the text stays verbatim.
 function codeContent(str, startCol, inContainer) {
   if (!inContainer || !/\S/.test(str)) return str;
   return expandLeadingTabs(str, startCol);
@@ -606,7 +608,7 @@ function parseBlocks(src, refs) {
           continue;
         }
         t.lines.push(codeContent(dropIndent(rem, t.fenceIndent || 0, col),
-          col + (t.fenceIndent || 0), true));
+          col + (t.fenceIndent || 0), stackBelowTipInContainer()));
         continue;
       }
     }
@@ -1068,7 +1070,7 @@ const CLOSE_TAG_RE = new RegExp('^<\\/' + TAG_NAME + '\\s*>');
 const AUTOLINK_URI_RE = /^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/;
 const AUTOLINK_EMAIL_RE = /^<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)>/;
 const EXT_URL_RE = /^(?:[hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/|www\.)[^\s<]+/;
-const EMAIL_CORE = "[A-Za-z0-9.!#$%&'*+\\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+";
+const EMAIL_CORE = "[A-Za-z0-9.!#$%&'*+\\/=?^_`{|}~-]+@(?:[A-Za-z0-9_-]+\\.)+[A-Za-z0-9_-]*[A-Za-z0-9]";
 const EXT_EMAIL_RE = new RegExp('^' + EMAIL_CORE);
 const SCHEME_EMAIL_RE = new RegExp('^(mailto|xmpp):(' + EMAIL_CORE + ')');
 const EMAIL_PREV_BAD = /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~@-]/;
@@ -1167,13 +1169,20 @@ function parseInline(s, refs, state, extOff) {
       const c = s[j];
       if (c === '\\' && j + 1 < n && isPunct(s[j + 1])) { j += 2; continue; }
       if (c === '`') {
+        // Loose code span: a backtick run, non-backtick content, and a
+        // closing run of any length. An unclosed run fails the label,
+        // except a run of 2+ sitting immediately before the closing
+        // bracket, which counts as plain text.
         let run = 0;
         while (s[j + run] === '`') run++;
         let k = j + run;
         while (k < n && s[k] !== '`') k++;
-        if (k >= n) return -1;
-        while (s[k] === '`') k++;
-        j = k; continue;
+        if (k < n) {
+          while (s[k] === '`') k++;
+          j = k; continue;
+        }
+        if (run >= 2 && depth === 0 && s[j + run] === ']') { j += run; continue; }
+        return -1;
       }
       if (c === '<') {
         // HTML tags, comments, and <...> autolinks inside a label are
@@ -1396,30 +1405,43 @@ function parseInline(s, refs, state, extOff) {
       }
       // Emails: the match must not be preceded by a character that could
       // belong to a longer address, and must not be followed by one that
-      // would extend the domain (letters, digits, '_' or '-').
-      if (i === 0 || !EMAIL_PREV_BAD.test(s[i - 1])) {
+      // would extend the domain. A blocker that is only '_' or '-' may be
+      // an emphasis delimiter: defer those matches as candidates and let
+      // the post-emphasis pass decide with the tree as context (marked
+      // re-lexes emphasis content as its own string, so a paired
+      // delimiter is a string edge there, not a blocking character).
+      const prevCh = i === 0 ? null : s[i - 1];
+      const prevHardBad = prevCh !== null && EMAIL_PREV_BAD.test(prevCh) &&
+        prevCh !== '_' && prevCh !== '-';
+      if (!prevHardBad) {
+        let text = null, href = null;
         const sm = SCHEME_EMAIL_RE.exec(rest);
         if (sm) {
-          let text = sm[0];
-          let nx = s[i + text.length];
-          if (sm[1] === 'xmpp' && nx === '/') {
+          text = sm[0];
+          if (sm[1] === 'xmpp' && s[i + text.length] === '/') {
             const rm = /^\/[A-Za-z0-9@._~-]+/.exec(rest.slice(text.length));
-            if (rm) { text += rm[0]; nx = s[i + text.length]; }
+            if (rm) text += rm[0];
           }
-          if (nx === undefined || !/[A-Za-z0-9_-]/.test(nx)) {
+          href = text;
+        } else {
+          const em = EXT_EMAIL_RE.exec(rest);
+          if (em) { text = em[0]; href = 'mailto:' + text; }
+        }
+        if (text !== null) {
+          const nx = i + text.length >= n ? null : s[i + text.length];
+          const nextBad = nx !== null && /[A-Za-z0-9_-]/.test(nx);
+          const softBlocked = prevCh === '_' || prevCh === '-' ||
+            (nextBad && (nx === '_' || nx === '-'));
+          if (!nextBad && prevCh !== '_' && prevCh !== '-') {
             flushText();
-            nodes.push({ k: 'link', href: text, title: null, ext: true, children: [{ k: 't', s: text }] });
+            nodes.push({ k: 'link', href, title: null, ext: true, children: [{ k: 't', s: text }] });
             i += text.length;
             continue;
           }
-        }
-        const em = EXT_EMAIL_RE.exec(rest);
-        if (em) {
-          const nx = s[i + em[0].length];
-          if (nx === undefined || !/[A-Za-z0-9_-]/.test(nx)) {
+          if (softBlocked) {
             flushText();
-            nodes.push({ k: 'link', href: 'mailto:' + em[0], title: null, ext: true, children: [{ k: 't', s: em[0] }] });
-            i += em[0].length;
+            nodes.push({ k: 'emcand', text, href });
+            i += text.length;
             continue;
           }
         }
@@ -1431,7 +1453,42 @@ function parseInline(s, refs, state, extOff) {
   }
   flushText();
   processEmphasis(0);
+  resolveEmailCandidates(nodes);
   return nodes;
+}
+
+// Decide deferred email candidates (see the email branch in parseInline):
+// a candidate links unless a real blocking character is adjacent in the
+// final tree. Element neighbours (code, html, em, ...) count as neutral
+// boundaries; a leftover literal delimiter counts by its character.
+function resolveEmailCandidates(list) {
+  const rawLast = (nd) => {
+    if (nd.k === 't') return nd.s.length ? nd.s[nd.s.length - 1] : undefined;
+    if (nd.k === 'delim') return nd.len > 0 ? nd.ch : undefined;
+    if (nd.k === 'emcand') return nd.text[nd.text.length - 1];
+    return null; // neutral element boundary
+  };
+  const rawFirst = (nd) => {
+    if (nd.k === 't') return nd.s.length ? nd.s[0] : undefined;
+    if (nd.k === 'delim') return nd.len > 0 ? nd.ch : undefined;
+    if (nd.k === 'emcand') return nd.text[0];
+    return null;
+  };
+  for (let idx = 0; idx < list.length; idx++) {
+    const nd = list[idx];
+    if (nd.children && nd.k !== 'link' && nd.k !== 'img') resolveEmailCandidates(nd.children);
+    if (nd.k !== 'emcand') continue;
+    let pv, nx;
+    for (let j = idx - 1; j >= 0; j--) { pv = rawLast(list[j]); if (pv !== undefined) break; }
+    for (let j = idx + 1; j < list.length; j++) { nx = rawFirst(list[j]); if (nx !== undefined) break; }
+    const prev = pv === undefined ? null : pv;
+    const next = nx === undefined ? null : nx;
+    const prevBad = prev !== null && EMAIL_PREV_BAD.test(prev);
+    const nextBad = next !== null && /[A-Za-z0-9_-]/.test(next);
+    list[idx] = (!prevBad && !nextBad)
+      ? { k: 'link', href: nd.href, title: null, ext: true, children: [{ k: 't', s: nd.text }] }
+      : { k: 't', s: nd.text };
+  }
 }
 
 // Parse "(dest title)" starting at s[pos] === '('. Returns {href,title,end}.
